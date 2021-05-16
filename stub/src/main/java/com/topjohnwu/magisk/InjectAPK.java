@@ -4,74 +4,115 @@ import android.app.AppComponentFactory;
 import android.app.Application;
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.ContextWrapper;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.util.Log;
-
-import com.topjohnwu.magisk.utils.DynamicClassLoader;
 
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.HashMap;
+import java.lang.reflect.Field;
 
 public class InjectAPK {
 
-    static DelegateComponentFactory factory;
+    static Object componentFactory;
 
+    private static DelegateComponentFactory getComponentFactory() {
+        return (DelegateComponentFactory) componentFactory;
+    }
+
+    @SuppressWarnings("ResultOfMethodCallIgnored")
     static Application setup(Context context) {
+        // Get ContextImpl
+        while (context instanceof ContextWrapper) {
+            context = ((ContextWrapper) context).getBaseContext();
+        }
+
         File apk = DynAPK.current(context);
         File update = DynAPK.update(context);
         if (update.exists())
             update.renameTo(apk);
-        Application delegate = null;
         if (!apk.exists()) {
             // Try copying APK
             Uri uri = new Uri.Builder().scheme("content")
                     .authority("com.topjohnwu.magisk.provider")
                     .encodedPath("apk_file").build();
             ContentResolver resolver = context.getContentResolver();
-            try (InputStream is = resolver.openInputStream(uri)) {
-                if (is != null) {
+            try (InputStream src = resolver.openInputStream(uri)) {
+                if (src != null) {
                     try (OutputStream out = new FileOutputStream(apk)) {
                         byte[] buf = new byte[4096];
-                        for (int read; (read = is.read(buf)) >= 0;) {
+                        for (int read; (read = src.read(buf)) >= 0;) {
                             out.write(buf, 0, read);
                         }
                     }
                 }
-            } catch (Exception e) {
-                Log.e(InjectAPK.class.getSimpleName(), "", e);
-            }
+            } catch (Exception ignored) {}
         }
         if (apk.exists()) {
-            ClassLoader cl = new DynamicClassLoader(apk, factory.loader);
+            ClassLoader cl = new InjectedClassLoader(apk);
+            PackageManager pm = context.getPackageManager();
+            ApplicationInfo info = pm.getPackageArchiveInfo(apk.getPath(), 0).applicationInfo;
             try {
-                // Create the delegate AppComponentFactory
-                AppComponentFactory df = (AppComponentFactory)
-                        cl.loadClass("androidx.core.app.CoreComponentFactory").newInstance();
-
-                // Create the delegate Application
-                delegate = (Application) cl.loadClass("a.e").getConstructor(Object.class)
+                // Create the receiver Application
+                Object app = cl.loadClass(info.className)
+                        .getConstructor(Object.class)
                         .newInstance(DynAPK.pack(dynData()));
 
-                // If everything went well, set our loader and delegate
-                factory.delegate = df;
-                factory.loader = cl;
+                // Create the receiver component factory
+                Object factory = null;
+                if (Build.VERSION.SDK_INT >= 28) {
+                    factory = cl.loadClass(info.appComponentFactory).newInstance();
+                }
+
+                setClassLoader(context, cl);
+
+                // Finally, set variables
+                if (Build.VERSION.SDK_INT >= 28) {
+                    getComponentFactory().loader = cl;
+                    getComponentFactory().receiver = (AppComponentFactory) factory;
+                }
+
+                return (Application) app;
             } catch (Exception e) {
                 Log.e(InjectAPK.class.getSimpleName(), "", e);
                 apk.delete();
             }
+            // fallthrough
         }
-        return delegate;
+
+        ClassLoader cl = new RedirectClassLoader();
+        try {
+            setClassLoader(context, cl);
+            if (Build.VERSION.SDK_INT >= 28) {
+                getComponentFactory().loader = cl;
+            }
+        } catch (Exception e) {
+            Log.e(InjectAPK.class.getSimpleName(), "", e);
+        }
+
+        return null;
+    }
+
+    // Replace LoadedApk mClassLoader
+    private static void setClassLoader(Context impl, ClassLoader cl)
+            throws NoSuchFieldException, IllegalAccessException {
+        Field mInfo = impl.getClass().getDeclaredField("mPackageInfo");
+        mInfo.setAccessible(true);
+        Object loadedApk = mInfo.get(impl);
+        Field mcl = loadedApk.getClass().getDeclaredField("mClassLoader");
+        mcl.setAccessible(true);
+        mcl.set(loadedApk, cl);
     }
 
     private static DynAPK.Data dynData() {
         DynAPK.Data data = new DynAPK.Data();
         data.version = BuildConfig.STUB_VERSION;
-        // Public source code does not do component name obfuscation
-        data.classToComponent = new HashMap<>();
+        data.classToComponent = Mapping.inverseMap;
         return data;
     }
 

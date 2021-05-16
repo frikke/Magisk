@@ -8,26 +8,30 @@
 #define UID_ROOT   0
 #define UID_SHELL  2000
 
+#define DISALLOW_COPY_AND_MOVE(clazz) \
+clazz(const clazz &) = delete; \
+clazz(clazz &&) = delete;
+
 class mutex_guard {
+    DISALLOW_COPY_AND_MOVE(mutex_guard)
 public:
     explicit mutex_guard(pthread_mutex_t &m): mutex(&m) {
         pthread_mutex_lock(mutex);
     }
-
-    explicit mutex_guard(pthread_mutex_t *m): mutex(m) {
-        pthread_mutex_lock(mutex);
-    }
-
-    ~mutex_guard() {
+    void unlock() {
         pthread_mutex_unlock(mutex);
+        mutex = nullptr;
     }
-
+    ~mutex_guard() {
+        if (mutex) pthread_mutex_unlock(mutex);
+    }
 private:
     pthread_mutex_t *mutex;
 };
 
 template <class Func>
 class run_finally {
+    DISALLOW_COPY_AND_MOVE(run_finally)
 public:
     explicit run_finally(const Func &fn) : fn(fn) {}
     ~run_finally() { fn(); }
@@ -59,14 +63,15 @@ static inline int parse_int(const std::string &s) { return parse_int(s.data()); 
 static inline int parse_int(std::string_view s) { return parse_int(s.data()); }
 
 using thread_entry = void *(*)(void *);
-int new_daemon_thread(thread_entry entry, void *arg = nullptr, const pthread_attr_t *attr = nullptr);
+int new_daemon_thread(thread_entry entry, void *arg = nullptr);
+int new_daemon_thread(void(*entry)());
 int new_daemon_thread(std::function<void()> &&entry);
 
 static inline bool str_contains(std::string_view s, std::string_view ss) {
     return s.find(ss) != std::string::npos;
 }
 static inline bool str_starts(std::string_view s, std::string_view ss) {
-    return s.rfind(ss, 0) == 0;
+    return s.size() >= ss.size() && s.compare(0, ss.size(), ss) == 0;
 }
 static inline bool str_ends(std::string_view s, std::string_view ss) {
     return s.size() >= ss.size() && s.compare(s.size() - ss.size(), std::string::npos, ss) == 0;

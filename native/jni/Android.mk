@@ -4,6 +4,9 @@ LOCAL_PATH := $(call my-dir)
 # Binaries
 ########################
 
+# Global toggle for the WIP zygote injection features
+ENABLE_INJECT := 0
+
 ifdef B_MAGISK
 
 include $(CLEAR_VARS)
@@ -22,7 +25,6 @@ LOCAL_SRC_FILES := \
     core/restorecon.cpp \
     core/module.cpp \
     magiskhide/magiskhide.cpp \
-    magiskhide/proc_monitor.cpp \
     magiskhide/hide_utils.cpp \
     magiskhide/hide_policy.cpp \
     resetprop/persist_properties.cpp \
@@ -33,6 +35,18 @@ LOCAL_SRC_FILES := \
     su/su_daemon.cpp
 
 LOCAL_LDLIBS := -llog
+LOCAL_CPPFLAGS := -DENABLE_INJECT=$(ENABLE_INJECT)
+
+ifeq ($(ENABLE_INJECT),1)
+LOCAL_STATIC_LIBRARIES += libxhook
+LOCAL_SRC_FILES += \
+    inject/entry.cpp \
+    inject/utils.cpp \
+    inject/hook.cpp
+else
+LOCAL_SRC_FILES += magiskhide/proc_monitor.cpp
+endif
+
 include $(BUILD_EXECUTABLE)
 
 endif
@@ -40,21 +54,10 @@ endif
 include $(CLEAR_VARS)
 
 ifdef B_INIT
+
 LOCAL_MODULE := magiskinit
-BB_INIT := 1
-else ifdef B_INIT64
-LOCAL_MODULE := magiskinit64
-LOCAL_CPPFLAGS += -DUSE_64BIT
-BB_INIT := 1
-endif
-
-ifdef BB_INIT
-
 LOCAL_STATIC_LIBRARIES := libsepol libxz libutils
-LOCAL_C_INCLUDES := \
-    jni/include \
-    out \
-    out/$(TARGET_ARCH_ABI)
+LOCAL_C_INCLUDES := jni/include out
 
 LOCAL_SRC_FILES := \
     init/init.cpp \
@@ -80,7 +83,7 @@ ifdef B_BOOT
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := magiskboot
-LOCAL_STATIC_LIBRARIES := libmincrypt liblzma liblz4 libbz2 libfdt libutils
+LOCAL_STATIC_LIBRARIES := libmincrypt liblzma liblz4 libbz2 libfdt libutils libz
 LOCAL_C_INCLUDES := jni/include
 
 LOCAL_SRC_FILES := \
@@ -94,7 +97,6 @@ LOCAL_SRC_FILES := \
     magiskboot/pattern.cpp \
     utils/cpio.cpp
 
-LOCAL_LDLIBS := -lz
 LOCAL_LDFLAGS := -static
 include $(BUILD_EXECUTABLE)
 
@@ -140,15 +142,16 @@ include $(BUILD_EXECUTABLE)
 endif
 
 ifdef B_TEST
+ifneq (,$(wildcard jni/test.cpp))
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := test
 LOCAL_STATIC_LIBRARIES := libutils
 LOCAL_C_INCLUDES := jni/include
 LOCAL_SRC_FILES := test.cpp
-LOCAL_LDFLAGS := -static
 include $(BUILD_EXECUTABLE)
 
+endif
 endif
 
 ifdef B_BB

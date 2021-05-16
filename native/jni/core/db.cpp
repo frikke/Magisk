@@ -1,14 +1,10 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <time.h>
-#include <string.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 
 #include <magisk.hpp>
 #include <db.hpp>
-#include <daemon.hpp>
+#include <socket.hpp>
 #include <utils.hpp>
 
 #define DB_VERSION 10
@@ -57,7 +53,7 @@ static void (*android_update_LD_LIBRARY_PATH)(const char *ld_library_path);
 }
 
 #ifdef __LP64__
-constexpr char apex_path[] = "/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64";
+constexpr char apex_path[] = "/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64:";
 #else
 constexpr char apex_path[] = "/apex/com.android.runtime/lib:/apex/com.android.art/lib:/apex/com.android.i18n/lib:";
 #endif
@@ -373,8 +369,8 @@ bool validate_manager(string &pkg, int userid, struct stat *st) {
 
 void exec_sql(int client) {
     run_finally f([=]{ close(client); });
-    char *sql = read_string(client);
-    char *err = db_exec(sql, [&](db_row &row) -> bool {
+    string sql = read_string(client);
+    char *err = db_exec(sql.data(), [client](db_row &row) -> bool {
         string out;
         bool first = true;
         for (auto it : row) {
@@ -384,11 +380,9 @@ void exec_sql(int client) {
             out += '=';
             out += it.second;
         }
-        write_int(client, out.length());
-        xwrite(client, out.data(), out.length());
+        write_string(client, out);
         return true;
     });
-    free(sql);
     write_int(client, 0);
     db_err_cmd(err, return; );
 }

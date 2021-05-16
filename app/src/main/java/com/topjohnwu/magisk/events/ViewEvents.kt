@@ -14,20 +14,22 @@ import com.topjohnwu.magisk.core.Const
 import com.topjohnwu.magisk.core.base.ActivityResultCallback
 import com.topjohnwu.magisk.core.base.BaseActivity
 import com.topjohnwu.magisk.core.model.module.OnlineModule
+import com.topjohnwu.magisk.events.dialog.MarkDownDialog
 import com.topjohnwu.magisk.utils.Utils
-import com.topjohnwu.magisk.view.MarkDownWindow
+import com.topjohnwu.magisk.view.MagiskDialog
 import com.topjohnwu.magisk.view.Shortcuts
-import kotlinx.coroutines.launch
 
 class ViewActionEvent(val action: BaseActivity.() -> Unit) : ViewEvent(), ActivityExecutor {
     override fun invoke(activity: BaseUIActivity<*, *>) = action(activity)
 }
 
-class OpenReadmeEvent(val item: OnlineModule) : ViewEventWithScope(), ContextExecutor {
-    override fun invoke(context: Context) {
-        scope.launch {
-            MarkDownWindow.show(context, null, item::notes)
-        }
+class OpenReadmeEvent(private val item: OnlineModule) : MarkDownDialog() {
+    override suspend fun getMarkdownText() = item.notes()
+    override fun build(dialog: MagiskDialog) {
+        super.build(dialog)
+        dialog.applyButton(MagiskDialog.ButtonType.NEGATIVE) {
+            titleRes = android.R.string.cancel
+        }.cancellable(true)
     }
 }
 
@@ -78,7 +80,7 @@ class MagiskInstallFileEvent(private val callback: ActivityResultCallback)
     override fun invoke(activity: BaseUIActivity<*, *>) {
         val intent = Intent(Intent.ACTION_GET_CONTENT).setType("*/*")
         try {
-            activity.startActivityForResult(intent, Const.ID.SELECT_FILE, callback)
+            activity.startActivityForResult(intent, callback)
             Utils.toast(R.string.patch_file_msg, Toast.LENGTH_LONG)
         } catch (e: ActivityNotFoundException) {
             Utils.toast(R.string.app_not_found, Toast.LENGTH_SHORT)
@@ -107,10 +109,10 @@ class SelectModuleEvent : ViewEvent(), FragmentExecutor {
         val intent = Intent(Intent.ACTION_GET_CONTENT).setType("application/zip")
         try {
             fragment.apply {
-                activity.startActivityForResult(intent, Const.ID.FETCH_ZIP) { code, intent ->
+                activity.startActivityForResult(intent) { code, intent ->
                     if (code == Activity.RESULT_OK && intent != null) {
                         intent.data?.also {
-                            MainDirections.actionFlashFragment(it, Const.Value.FLASH_ZIP).navigate()
+                            MainDirections.actionFlashFragment(Const.Value.FLASH_ZIP, it).navigate()
                         }
                     }
                 }

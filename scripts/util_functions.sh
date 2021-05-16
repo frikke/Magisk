@@ -1,8 +1,5 @@
 ############################################
-#
 # Magisk General Utility Functions
-# by topjohnwu
-#
 ############################################
 
 #MAGISK_VERSION_STUB
@@ -33,27 +30,37 @@ grep_prop() {
   shift
   local FILES=$@
   [ -z "$FILES" ] && FILES='/system/build.prop'
-  cat $FILES | dos2unix | sed -n "$REGEX" 2>/dev/null | head -n 1
+  cat $FILES 2>/dev/null | dos2unix | sed -n "$REGEX" | head -n 1
+}
+
+grep_get_prop() {
+  local result=$(grep_prop $@)
+  if [ -z "$result" ]; then
+    # Fallback to getprop
+    getprop "$1"
+  else
+    echo $result
+  fi
 }
 
 getvar() {
   local VARNAME=$1
   local VALUE
   local PROPPATH='/data/.magisk /cache/.magisk'
-  [ -n $MAGISKTMP ] && PROPPATH="$MAGISKTMP/config $PROPPATH"
+  [ ! -z $MAGISKTMP ] && PROPPATH="$MAGISKTMP/config $PROPPATH"
   VALUE=$(grep_prop $VARNAME $PROPPATH)
   [ ! -z $VALUE ] && eval $VARNAME=\$VALUE
 }
 
 is_mounted() {
-  grep -q " `readlink -f $1` " /proc/mounts 2>/dev/null
+  grep -q " $(readlink -f $1) " /proc/mounts 2>/dev/null
   return $?
 }
 
 abort() {
   ui_print "$1"
   $BOOTMODE || recovery_cleanup
-  [ -n $MODPATH ] && rm -rf $MODPATH
+  [ ! -z $MODPATH ] && rm -rf $MODPATH
   rm -rf $TMPDIR
   exit 1
 }
@@ -96,6 +103,7 @@ setup_flashable() {
       fi
     done
   fi
+  recovery_actions
 }
 
 ensure_bb() {
@@ -309,51 +317,58 @@ mount_apex() {
   $BOOTMODE || [ ! -d /system/apex ] && return
   local APEX DEST
   setup_mntpoint /apex
+  mount -t tmpfs tmpfs /apex -o mode=755
+  local PATTERN='s/.*"name":[^"]*"\([^"]*\).*/\1/p'
   for APEX in /system/apex/*; do
-    DEST=/apex/$(basename $APEX .apex)
-    [ "$DEST" == /apex/com.android.runtime.release ] && DEST=/apex/com.android.runtime
-    mkdir -p $DEST 2>/dev/null
     if [ -f $APEX ]; then
       # APEX APKs, extract and loop mount
       unzip -qo $APEX apex_payload.img -d /apex
-      loop_setup apex_payload.img
+      DEST=$(unzip -qp $APEX apex_manifest.pb | strings | head -n 1)
+      [ -z $DEST ] && DEST=$(unzip -qp $APEX apex_manifest.json | sed -n $PATTERN)
+      [ -z $DEST ] && continue
+      DEST=/apex/$DEST
+      mkdir -p $DEST
+      loop_setup /apex/apex_payload.img
       if [ ! -z $LOOPDEV ]; then
         ui_print "- Mounting $DEST"
         mount -t ext4 -o ro,noatime $LOOPDEV $DEST
       fi
-      rm -f apex_payload.img
+      rm -f /apex/apex_payload.img
     elif [ -d $APEX ]; then
       # APEX folders, bind mount directory
+      if [ -f $APEX/apex_manifest.json ]; then
+        DEST=/apex/$(sed -n $PATTERN $APEX/apex_manifest.json)
+      elif [ -f $APEX/apex_manifest.pb ]; then
+        DEST=/apex/$(strings $APEX/apex_manifest.pb | head -n 1)
+      else
+        continue
+      fi
+      mkdir -p $DEST
       ui_print "- Mounting $DEST"
       mount -o bind $APEX $DEST
     fi
   done
   export ANDROID_RUNTIME_ROOT=/apex/com.android.runtime
   export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
-  local APEXRJPATH=/apex/com.android.runtime/javalib
-  local SYSFRAME=/system/framework
-  export BOOTCLASSPATH=\
-$APEXRJPATH/core-oj.jar:$APEXRJPATH/core-libart.jar:$APEXRJPATH/okhttp.jar:\
-$APEXRJPATH/bouncycastle.jar:$APEXRJPATH/apache-xml.jar:$SYSFRAME/framework.jar:\
-$SYSFRAME/ext.jar:$SYSFRAME/telephony-common.jar:$SYSFRAME/voip-common.jar:\
-$SYSFRAME/ims-common.jar:$SYSFRAME/android.test.base.jar:$SYSFRAME/telephony-ext.jar:\
-/apex/com.android.conscrypt/javalib/conscrypt.jar:\
-/apex/com.android.media/javalib/updatable-media.jar
+  export ANDROID_ART_ROOT=/apex/com.android.art
+  export ANDROID_I18N_ROOT=/apex/com.android.i18n
+  local APEXJARS=$(find /apex -name '*.jar' | sort | tr '\n' ':')
+  local FWK=/system/framework
+  export BOOTCLASSPATH=${APEXJARS}\
+$FWK/framework.jar:$FWK/ext.jar:$FWK/telephony-common.jar:\
+$FWK/voip-common.jar:$FWK/ims-common.jar:$FWK/telephony-ext.jar
 }
 
 umount_apex() {
   [ -d /apex ] || return
-  local DEST SRC
-  for DEST in /apex/*; do
-    [ "$DEST" = '/apex/*' ] && break
-    SRC=$(grep $DEST /proc/mounts | awk '{ print $1 }')
-    umount -l $DEST
-    # Detach loop device just in case
-    losetup -d $SRC 2>/dev/null
+  umount -l /apex
+  for loop in /dev/block/loop*; do
+    losetup -d $loop 2>/dev/null
   done
-  rm -rf /apex
   unset ANDROID_RUNTIME_ROOT
   unset ANDROID_TZDATA_ROOT
+  unset ANDROID_ART_ROOT
+  unset ANDROID_I18N_ROOT
   unset BOOTCLASSPATH
 }
 
@@ -402,7 +417,7 @@ find_boot_image() {
 
 flash_image() {
   case "$1" in
-    *.gz) CMD1="$MAGISKBIN/magiskboot decompress '$1' - 2>/dev/null";;
+    *.gz) CMD1="gzip -d < '$1' 2>/dev/null";;
     *)    CMD1="cat '$1'";;
   esac
   if $BOOTSIGNED; then
@@ -433,22 +448,9 @@ flash_image() {
 install_magisk() {
   cd $MAGISKBIN
 
-  # Dump image for MTD/NAND character device boot partitions
-  if [ -c $BOOTIMAGE ]; then
-    nanddump -f boot.img $BOOTIMAGE
-    local BOOTNAND=$BOOTIMAGE
-    BOOTIMAGE=boot.img
-  fi
-
-  if [ $API -ge 21 ]; then
+  if [ ! -c $BOOTIMAGE ]; then
     eval $BOOTSIGNER -verify < $BOOTIMAGE && BOOTSIGNED=true
     $BOOTSIGNED && ui_print "- Boot image is signed with AVB 1.0"
-  fi
-
-  if $IS64BIT; then
-    mv -f magiskinit64 magiskinit 2>/dev/null
-  else
-    rm -f magiskinit64
   fi
 
   # Source the boot patcher
@@ -456,9 +458,6 @@ install_magisk() {
   . ./boot_patch.sh "$BOOTIMAGE"
 
   ui_print "- Flashing new boot image"
-
-  # Restore the original boot partition path
-  [ "$BOOTNAND" ] && BOOTIMAGE=$BOOTNAND
   flash_image new-boot.img "$BOOTIMAGE"
   case $? in
     1)
@@ -519,18 +518,26 @@ remove_system_su() {
 }
 
 api_level_arch_detect() {
-  API=`grep_prop ro.build.version.sdk`
-  ABI=`grep_prop ro.product.cpu.abi | cut -c-3`
-  ABI2=`grep_prop ro.product.cpu.abi2 | cut -c-3`
-  ABILONG=`grep_prop ro.product.cpu.abi`
-
-  ARCH=arm
-  ARCH32=arm
-  IS64BIT=false
-  if [ "$ABI" = "x86" ]; then ARCH=x86; ARCH32=x86; fi;
-  if [ "$ABI2" = "x86" ]; then ARCH=x86; ARCH32=x86; fi;
-  if [ "$ABILONG" = "arm64-v8a" ]; then ARCH=arm64; ARCH32=arm; IS64BIT=true; fi;
-  if [ "$ABILONG" = "x86_64" ]; then ARCH=x64; ARCH32=x86; IS64BIT=true; fi;
+  API=$(grep_get_prop ro.build.version.sdk)
+  ABI=$(grep_get_prop ro.product.cpu.abi)
+  if [ "$ABI" = "x86" ]; then
+    ARCH=x86
+    ABI32=x86
+    IS64BIT=false
+  elif [ "$ABI" = "arm64-v8a" ]; then
+    ARCH=arm64
+    ABI32=armeabi-v7a
+    IS64BIT=true
+  elif [ "$ABI" = "x86_64" ]; then
+    ARCH=x64
+    ABI32=x86
+    IS64BIT=true
+  else
+    ARCH=arm
+    ABI=armeabi-v7a
+    ABI32=armeabi-v7a
+    IS64BIT=false
+  fi
 }
 
 check_data() {
@@ -539,9 +546,8 @@ check_data() {
   if grep ' /data ' /proc/mounts | grep -vq 'tmpfs'; then
     # Test if data is writable
     touch /data/.rw && rm /data/.rw && DATA=true
-    # Test if DE storage is writable
+    # Test if data is decrypted
     $DATA && [ -d /data/adb ] && touch /data/adb/.rw && rm /data/adb/.rw && DATA_DE=true
-    # Some recovery have broken FDE implementations, which cannot access existing folders
     $DATA_DE && [ -d /data/adb/magisk ] || mkdir /data/adb/magisk || DATA_DE=false
   fi
   NVBASE=/data
@@ -550,18 +556,20 @@ check_data() {
   resolve_vars
 }
 
-find_manager_apk() {
+find_magisk_apk() {
   local DBAPK
   [ -z $APK ] && APK=/data/adb/magisk.apk
   [ -f $APK ] || APK=/data/magisk/magisk.apk
   [ -f $APK ] || APK=/data/app/com.topjohnwu.magisk*/*.apk
+  [ -f $APK ] || APK=/data/app/*/com.topjohnwu.magisk*/*.apk
   if [ ! -f $APK ]; then
     DBAPK=$(magisk --sqlite "SELECT value FROM strings WHERE key='requester'" 2>/dev/null | cut -d= -f2)
-    [ -z $DBAPK ] && DBAPK=$(strings /data/adb/magisk.db | grep -E '^.requester.' | cut -c11-)
+    [ -z $DBAPK ] && DBAPK=$(strings /data/adb/magisk.db | grep -oE 'requester..*' | cut -c10-)
     [ -z $DBAPK ] || APK=/data/user_de/*/$DBAPK/dyn/*.apk
     [ -f $APK ] || [ -z $DBAPK ] || APK=/data/app/$DBAPK*/*.apk
+    [ -f $APK ] || [ -z $DBAPK ] || APK=/data/app/*/$DBAPK*/*.apk
   fi
-  [ -f $APK ] || ui_print "! Unable to detect Magisk Manager APK for BootSigner"
+  [ -f $APK ] || ui_print "! Unable to detect Magisk app APK for BootSigner"
 }
 
 run_migrations() {
@@ -606,9 +614,10 @@ copy_sepolicy_rules() {
   # Find current active RULESDIR
   local RULESDIR
   local active_dir=$(magisk --path)/.magisk/mirror/sepolicy.rules
-  if [ -e $active_dir ]; then
-    RULESDIR=$(readlink -f $active_dir)
-  elif [ -d /data/unencrypted ] && ! grep ' /data ' /proc/mounts | grep -q 'dm-'; then
+  if [ -L $active_dir ]; then
+    RULESDIR=$(readlink $active_dir)
+    [ "${RULESDIR:0:1}" != "/" ] && RULESDIR="$(magisk --path)/.magisk/mirror/$RULESDIR"
+  elif [ -d /data/unencrypted ] && ! grep ' /data ' /proc/mounts | grep -qE 'dm-|f2fs'; then
     RULESDIR=/data/unencrypted/magisk
   elif grep -q ' /cache ' /proc/mounts; then
     RULESDIR=/cache/magisk
@@ -681,6 +690,7 @@ is_legacy_script() {
 install_module() {
   rm -rf $TMPDIR
   mkdir -p $TMPDIR
+  cd $TMPDIR
 
   setup_flashable
   mount_partitions
@@ -753,7 +763,7 @@ install_module() {
   done
 
   if $BOOTMODE; then
-    # Update info for Magisk Manager
+    # Update info for Magisk app
     mktouch $NVBASE/modules/$MODID/update
     cp -af $MODPATH/module.prop $NVBASE/modules/$MODID/module.prop
   fi
@@ -764,10 +774,11 @@ install_module() {
     copy_sepolicy_rules
   fi
 
-  # Remove stuffs that don't belong to modules
+  # Remove stuff that doesn't belong to modules and clean up any empty directories
   rm -rf \
   $MODPATH/system/placeholder $MODPATH/customize.sh \
   $MODPATH/README.md $MODPATH/.git*
+  rmdir -p $MODPATH
 
   cd /
   $BOOTMODE || recovery_cleanup
@@ -789,7 +800,7 @@ NVBASE=/data/adb
 TMPDIR=/dev/tmp
 
 # Bootsigner related stuff
-BOOTSIGNERCLASS=a.a
+BOOTSIGNERCLASS=com.topjohnwu.signing.SignBoot
 BOOTSIGNER='/system/bin/dalvikvm -Xnoimage-dex2oat -cp $APK $BOOTSIGNERCLASS'
 BOOTSIGNED=false
 

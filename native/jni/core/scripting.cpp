@@ -6,6 +6,8 @@
 #include <utils.hpp>
 #include <selinux.hpp>
 
+#include "core.hpp"
+
 using namespace std;
 
 #define BBEXEC_CMD bbpath(), "sh"
@@ -190,9 +192,11 @@ void install_module(const char *file) {
     if (access(file, F_OK))
         abort(stderr, "'%s' does not exist", file);
 
+    char *zip = realpath(file, nullptr);
     setenv("OUTFD", "1", 1);
-    setenv("ZIPFILE", file, 1);
+    setenv("ZIPFILE", zip, 1);
     setenv("ASH_STANDALONE", "1", 1);
+    free(zip);
 
     int fd = xopen("/dev/null", O_RDONLY);
     xdup2(fd, STDERR_FILENO);

@@ -13,6 +13,8 @@
 #include <resetprop.hpp>
 #include <selinux.hpp>
 
+#include "core.hpp"
+
 using namespace std;
 
 static bool safe_mode = false;
@@ -97,13 +99,6 @@ static void mount_mirrors() {
     link_mirror(system_ext)
 }
 
-constexpr char bb_script[] = R"EOF(
-#!/system/bin/sh
-BB=%s
-[ -x $BB ] && exec $BB "$@"
-exec /data/adb/magisk/busybox.bin "$@"
-)EOF";
-
 static bool magisk_env() {
     char buf[4096];
 
@@ -145,26 +140,12 @@ static bool magisk_env() {
     xmkdir(SECURE_DIR "/post-fs-data.d", 0755);
     xmkdir(SECURE_DIR "/service.d", 0755);
 
-    // Disable/remove magiskhide, resetprop
-    if (SDK_INT < 19) {
-        unlink("/sbin/resetprop");
-        unlink("/sbin/magiskhide");
-    }
-
-    if (access(DATABIN "/busybox.bin", X_OK)) {
-        if (access(DATABIN "/busybox", X_OK))
-            return false;
-        rename(DATABIN "/busybox", DATABIN "/busybox.bin");
-    }
+    if (access(DATABIN "/busybox", X_OK))
+        return false;
 
     sprintf(buf, "%s/" BBPATH "/busybox", MAGISKTMP.data());
-    {
-        auto fp = open_file(DATABIN "/busybox", "we");
-        fprintf(fp.get(), bb_script, buf);
-    }
-    chmod(DATABIN "/busybox", 0755);
     mkdir(dirname(buf), 0755);
-    cp_afc(DATABIN "/busybox.bin", buf);
+    cp_afc(DATABIN "/busybox", buf);
     exec_command_async(buf, "--install", "-s", dirname(buf));
 
     return true;
@@ -302,7 +283,7 @@ void post_fs_data(int client) {
         } else {
             // If the folder is not automatically created by Android,
             // do NOT proceed further. Manual creation of the folder
-            // will cause bootloops on FBE devices.
+            // will have no encryption flag, which will cause bootloops on FBE devices.
             LOGE(SECURE_DIR " is not present, abort\n");
             goto early_abort;
         }
@@ -320,7 +301,7 @@ void post_fs_data(int client) {
         stop_magiskhide();
     } else {
         exec_common_scripts("post-fs-data");
-        auto_start_magiskhide();
+        auto_start_magiskhide(false);
         handle_modules();
     }
 
@@ -369,7 +350,7 @@ void boot_complete(int client) {
     if (access(SECURE_DIR, F_OK) != 0)
         xmkdir(SECURE_DIR, 0700);
 
-    auto_start_magiskhide();
+    auto_start_magiskhide(true);
 
     if (!check_manager()) {
         if (access(MANAGERAPK, F_OK) == 0) {

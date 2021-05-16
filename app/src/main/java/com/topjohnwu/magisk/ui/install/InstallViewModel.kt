@@ -5,29 +5,30 @@ import android.net.Uri
 import androidx.databinding.Bindable
 import androidx.lifecycle.viewModelScope
 import com.topjohnwu.magisk.BR
+import com.topjohnwu.magisk.BuildConfig
 import com.topjohnwu.magisk.R
 import com.topjohnwu.magisk.arch.BaseViewModel
+import com.topjohnwu.magisk.core.Const
 import com.topjohnwu.magisk.core.Info
-import com.topjohnwu.magisk.core.download.Action
-import com.topjohnwu.magisk.core.download.DownloadService
-import com.topjohnwu.magisk.core.download.Subject
 import com.topjohnwu.magisk.data.repository.NetworkService
+import com.topjohnwu.magisk.di.AppContext
 import com.topjohnwu.magisk.events.MagiskInstallFileEvent
 import com.topjohnwu.magisk.events.dialog.SecondSlotWarningDialog
+import com.topjohnwu.magisk.ui.flash.FlashFragment
 import com.topjohnwu.magisk.utils.set
 import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.launch
-import org.koin.core.get
 import timber.log.Timber
+import java.io.File
 import java.io.IOException
-import kotlin.math.roundToInt
 
 class InstallViewModel(
     svc: NetworkService
-) : BaseViewModel(State.LOADED) {
+) : BaseViewModel() {
 
     val isRooted = Shell.rootAccess()
-    val skipOptions = Info.ramdisk && !Info.isFDE && Info.isSAR
+    val skipOptions = Info.isEmulator || (Info.ramdisk && !Info.isFDE && Info.isSAR)
+    val noSecondSlot = !isRooted || Info.isPixel || Info.isVirtualAB || !Info.isAB || Info.isEmulator
 
     @get:Bindable
     var step = if (skipOptions) 1 else 0
@@ -53,10 +54,6 @@ class InstallViewModel(
         }
 
     @get:Bindable
-    var progress = 0
-        set(value) = set(value, field, { field = it }, BR.progress)
-
-    @get:Bindable
     var data: Uri? = null
         set(value) = set(value, field, { field = it }, BR.data)
 
@@ -67,22 +64,20 @@ class InstallViewModel(
     init {
         viewModelScope.launch {
             try {
-                notes = svc.fetchString(Info.remote.magisk.note)
+                File(AppContext.cacheDir, "${BuildConfig.VERSION_CODE}.md").run {
+                    notes = when {
+                        exists() -> readText()
+                        Const.Url.CHANGELOG_URL.isEmpty() -> ""
+                        else -> {
+                            val text = svc.fetchString(Const.Url.CHANGELOG_URL)
+                            writeText(text)
+                            text
+                        }
+                    }
+                }
             } catch (e: IOException) {
                 Timber.e(e)
             }
-        }
-    }
-
-    fun onProgressUpdate(progress: Float, subject: Subject) {
-        if (subject !is Subject.Magisk) {
-            return
-        }
-        this.progress = progress.times(100).roundToInt()
-        if (this.progress >= 100) {
-            state = State.LOADED
-        } else if (this.progress < -150) {
-            state = State.LOADING_FAILED
         }
     }
 
@@ -91,17 +86,12 @@ class InstallViewModel(
     }
 
     fun install() {
-        DownloadService.start(get(), Subject.Magisk(resolveAction()))
+        when (method) {
+            R.id.method_patch -> FlashFragment.patch(data!!).navigate()
+            R.id.method_direct -> FlashFragment.flash(false).navigate()
+            R.id.method_inactive_slot -> FlashFragment.flash(true).navigate()
+            else -> error("Unknown value")
+        }
         state = State.LOADING
-    }
-
-    // ---
-
-    private fun resolveAction() = when (method) {
-        R.id.method_download -> Action.Download
-        R.id.method_patch -> Action.Patch(data!!)
-        R.id.method_direct -> Action.Flash.Primary
-        R.id.method_inactive_slot -> Action.Flash.Secondary
-        else -> error("Unknown value")
     }
 }

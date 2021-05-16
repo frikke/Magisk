@@ -1,5 +1,3 @@
-#include <unistd.h>
-#include <sys/mman.h>
 #include <bitset>
 #include <vector>
 #include <map>
@@ -8,6 +6,7 @@
 
 #include "magiskboot.hpp"
 #include "dtb.hpp"
+#include "format.hpp"
 extern "C" {
 #include <libfdt.h>
 }
@@ -103,57 +102,58 @@ static void dtb_print(const char *file, bool fstab) {
     mmap_ro(file, dtb, size);
     // Loop through all the dtbs
     int dtb_num = 0;
-    for (int i = 0; i < size; ++i) {
-        if (memcmp(dtb + i, FDT_MAGIC_STR, 4) == 0) {
-            auto fdt = dtb + i;
-            if (fstab) {
-                int node = find_fstab(fdt);
-                if (node >= 0) {
-                    fprintf(stderr, "Found fstab in dtb.%04d\n", dtb_num);
-                    print_node(fdt, node);
-                }
-            } else {
-                fprintf(stderr, "Printing dtb.%04d\n", dtb_num);
-                print_node(fdt);
+    uint8_t * const end = dtb + size;
+    for (uint8_t *fdt = dtb; fdt < end;) {
+        fdt = static_cast<uint8_t*>(memmem(fdt, end - fdt, DTB_MAGIC, sizeof(fdt32_t)));
+        if (fdt == nullptr)
+            break;
+        if (fstab) {
+            int node = find_fstab(fdt);
+            if (node >= 0) {
+                fprintf(stderr, "Found fstab in dtb.%04d\n", dtb_num);
+                print_node(fdt, node);
             }
-            ++dtb_num;
-            i += fdt_totalsize(fdt) - 1;
+        } else {
+            fprintf(stderr, "Printing dtb.%04d\n", dtb_num);
+            print_node(fdt);
         }
+        ++dtb_num;
+        fdt += fdt_totalsize(fdt);
     }
     fprintf(stderr, "\n");
     munmap(dtb, size);
 }
 
+[[maybe_unused]]
+static bool dtb_patch_rebuild(uint8_t *dtb, size_t dtb_sz, const char *file);
+
 static bool dtb_patch(const char *file) {
-    bool keepverity = check_env("KEEPVERITY");
-    bool patched = false;
+    bool keep_verity = check_env("KEEPVERITY");
+
     size_t size;
     uint8_t *dtb;
     fprintf(stderr, "Loading dtbs from [%s]\n", file);
     mmap_rw(file, dtb, size);
-    // Loop through all the dtbs
-    int dtb_num = 0;
-    for (int i = 0; i < size; ++i) {
-        if (memcmp(dtb + i, FDT_MAGIC_STR, 4) == 0) {
-            auto fdt = dtb + i;
-            fprintf(stderr, "Loading dtb.%04d\n", dtb_num);
-            if (int fstab = find_fstab(fdt); fstab >= 0) {
-                int node;
-                fdt_for_each_subnode(node, fdt, fstab) {
-                    const char *name = fdt_get_name(fdt, node, nullptr);
-                    fprintf(stderr, "Found fstab entry [%s]\n", name);
-                    if (!keepverity) {
-                        int len;
-                        auto value = fdt_getprop(fdt, node, "fsmgr_flags", &len);
-                        patched |= patch_verity(const_cast<void *>(value), len) != len;
-                    }
+
+    bool patched = false;
+    uint8_t * const end = dtb + size;
+    for (uint8_t *fdt = dtb; fdt < end;) {
+        fdt = static_cast<uint8_t*>(memmem(fdt, end - fdt, DTB_MAGIC, sizeof(fdt32_t)));
+        if (fdt == nullptr)
+            break;
+        if (int fstab = find_fstab(fdt); fstab >= 0) {
+            int node;
+            fdt_for_each_subnode(node, fdt, fstab) {
+                if (!keep_verity) {
+                    int len;
+                    char *value = (char *) fdt_getprop(fdt, node, "fsmgr_flags", &len);
+                    patched |= patch_verity(value, len) != len;
                 }
             }
-            ++dtb_num;
-            i += fdt_totalsize(fdt) - 1;
         }
+        fdt += fdt_totalsize(fdt);
     }
-    fprintf(stderr, "\n");
+
     munmap(dtb, size);
     return patched;
 }
@@ -176,279 +176,248 @@ int dtb_commands(int argc, char *argv[]) {
 }
 
 namespace {
-    // Unused, but keep these precious code as they took TONs of effort to write
 
-    struct fdt_blob {
-        void *fdt;
-        uint32_t offset;
-        uint32_t len;
-    };
+struct fdt_blob {
+    void *fdt;
+    uint32_t offset;
+    uint32_t len;
+};
 
-    template <class Iter>
-    class fdt_map_iter {
-    public:
-        typedef decltype(std::declval<typename Iter::value_type::second_type>().fdt) value_type;
-        typedef value_type* pointer;
-        typedef value_type& reference;
+}
 
-        explicit fdt_map_iter(Iter j) : i(j) {}
-        fdt_map_iter& operator++() { ++i; return *this; }
-        fdt_map_iter operator++(int) { auto tmp = *this; ++(*this); return tmp; }
-        fdt_map_iter& operator--() { --i; return *this; }
-        fdt_map_iter operator--(int) { auto tmp = *this; --(*this); return tmp; }
-        bool operator==(fdt_map_iter j) const { return i == j.i; }
-        bool operator!=(fdt_map_iter j) const { return !(*this == j); }
-        reference operator*() { return i->second.fdt; }
-        pointer operator->() { return &i->second.fdt; }
-    private:
-        Iter i;
-    };
-
-    template<class Iter>
-    inline fdt_map_iter<Iter> make_iter(Iter j) { return fdt_map_iter<Iter>(j); }
-
-    template <typename Iter>
-    static bool fdt_patch(Iter first, Iter last) {
-        bool keepverity = check_env("KEEPVERITY");
-        bool redirect = check_env("TWOSTAGEINIT");
-        bool modified = false;
-
-        int idx = 0;
-        for (auto it = first; it != last; ++it) {
-            ++idx;
-            auto fdt = *it;
-            int fstab = find_fstab(fdt);
-            if (fstab < 0)
-                continue;
-            fprintf(stderr, "Found fstab in dtb.%04d\n", idx - 1);
-            int block;
-            fdt_for_each_subnode(block, fdt, fstab) {
-                const char *name = fdt_get_name(fdt, block, nullptr);
-                fprintf(stderr, "Found entry [%s] in fstab\n", name);
-                if (!keepverity) {
-                    int size;
-                    auto value = fdt_getprop(fdt, block, "fsmgr_flags", &size);
-                    char *copy = static_cast<char *>(memcpy(malloc(size), value, size));
-                    if (patch_verity(copy, size) != size) {
-                        modified = true;
-                        fdt_setprop_string(fdt, block, "fsmgr_flags", copy);
-                    }
-                    free(copy);
-                }
-                if (redirect && name == "system"sv) {
-                    modified = true;
-                    fprintf(stderr, "Changing mnt_point to /system_root\n");
-                    fdt_setprop_string(fdt, block, "mnt_point", "/system_root");
-                }
-            }
+static bool fdt_patch(void *fdt) {
+    int fstab = find_fstab(fdt);
+    if (fstab < 0)
+        return false;
+    bool modified = false;
+    int node;
+    fdt_for_each_subnode(node, fdt, fstab) {
+        const char *name = fdt_get_name(fdt, node, nullptr);
+        // Force remove AVB for 2SI since it may bootloop some devices
+        int len;
+        auto value = (const char *) fdt_getprop(fdt, node, "fsmgr_flags", &len);
+        string copy(value, len);
+        uint32_t new_len = patch_verity(copy.data(), len);
+        if (new_len != len) {
+            modified = true;
+            fdt_setprop(fdt, node, "fsmgr_flags", copy.data(), new_len);
         }
-        return modified;
+        if (name == "system"sv) {
+            fprintf(stderr, "Setting [mnt_point] to [/system_root]\n");
+            fdt_setprop_string(fdt, node, "mnt_point", "/system_root");
+            modified = true;
+        }
     }
+    return modified;
+}
 
 #define MAX_FDT_GROWTH 256
 
-    template <class Table, class Header>
-    static int dt_table_patch(const Header *hdr, const char *out) {
-        map<uint32_t, fdt_blob> dtb_map;
-        auto buf = reinterpret_cast<const uint8_t *>(hdr);
-        auto tables = reinterpret_cast<const Table *>(hdr + 1);
+template <class Table, class Header>
+static bool dt_table_patch(const Header *hdr, const char *out) {
+    map<uint32_t, fdt_blob> dtb_map;
+    auto buf = reinterpret_cast<const uint8_t *>(hdr);
+    auto tables = reinterpret_cast<const Table *>(buf + sizeof(Header));
 
-        constexpr bool is_dt_table = std::is_same_v<Header, dt_table_header>;
+    constexpr bool is_aosp = std::is_same_v<Header, dt_table_header>;
 
-        using endian_conv = uint32_t (*)(uint32_t);
-        endian_conv be_to_le;
-        endian_conv le_to_be;
-        if constexpr (is_dt_table) {
-            be_to_le = fdt32_to_cpu;
-            le_to_be = cpu_to_fdt32;
-        } else {
-            be_to_le = le_to_be = [](uint32_t x) -> auto { return x; };
+    // AOSP DTB store ints in big endian
+    using endian_conv = uint32_t (*)(uint32_t);
+    endian_conv be_to_le;
+    endian_conv le_to_be;
+    if constexpr (is_aosp) {
+        be_to_le = fdt32_to_cpu;
+        le_to_be = cpu_to_fdt32;
+    } else {
+        be_to_le = le_to_be = [](uint32_t x) { return x; };
+    }
+
+    // Collect all dtbs
+    auto num_dtb = be_to_le(hdr->num_dtbs);
+    for (int i = 0; i < num_dtb; ++i) {
+        auto offset = be_to_le(tables[i].offset);
+        if (dtb_map.count(offset) == 0) {
+            auto blob = buf + offset;
+            uint32_t size = fdt_totalsize(blob);
+            auto fdt = xmalloc(size + MAX_FDT_GROWTH);
+            memcpy(fdt, blob, size);
+            fdt_open_into(fdt, fdt, size + MAX_FDT_GROWTH);
+            dtb_map[offset] = { fdt, offset };
         }
+    }
+    if (dtb_map.empty())
+        return false;
 
-        // Collect all dtbs
-        auto num_dtb = be_to_le(hdr->num_dtbs);
-        for (int i = 0; i < num_dtb; ++i) {
-            auto offset = be_to_le(tables[i].offset);
-            if (dtb_map.count(offset) == 0) {
-                auto blob = buf + offset;
-                uint32_t size = fdt_totalsize(blob);
-                auto fdt = xmalloc(size + MAX_FDT_GROWTH);
-                memcpy(fdt, blob, size);
-                fdt_open_into(fdt, fdt, size + MAX_FDT_GROWTH);
-                dtb_map[offset] = { fdt, offset };
-            }
-        }
-        if (dtb_map.empty())
-            return 1;
+    // Patch fdt
+    bool modified = false;
+    for (auto &[_, blob] : dtb_map)
+        modified |= fdt_patch(blob.fdt);
+    if (!modified)
+        return false;
 
-        // Patch fdt
-        if (!fdt_patch(make_iter(dtb_map.begin()), make_iter(dtb_map.end())))
-            return 1;
+    unlink(out);
+    int fd = xopen(out, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
 
-        unlink(out);
-        int fd = xopen(out, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    // This value is only used if AOSP DTB
+    uint32_t total_size = 0;
 
-        uint32_t total_size = 0;
+    // Copy headers and tables
+    total_size += xwrite(fd, buf, dtb_map.begin()->first);
 
-        // Copy headers and tables
-        total_size += xwrite(fd, buf, dtb_map.begin()->first);
+    // mmap rw to patch table values retroactively
+    auto mmap_sz = lseek(fd, 0, SEEK_CUR);
+    auto addr = (uint8_t *) xmmap(nullptr, mmap_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
-        // mmap rw to patch table values retroactively
-        auto mmap_sz = lseek(fd, 0, SEEK_CUR);
-        auto addr = (uint8_t *) xmmap(nullptr, mmap_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // Guess alignment using gcd
+    uint32_t align = 1;
+    if constexpr (!is_aosp) {
+        auto it = dtb_map.begin();
+        align = (it++)->first;
+        for (; it != dtb_map.end(); ++it)
+            align = binary_gcd(align, it->first);
+    }
 
-        // Guess alignment using gcd
-        uint32_t align = 1;
-        if constexpr (!is_dt_table) {
-            auto it = dtb_map.begin();
-            align = (it++)->first;
-            for (; it != dtb_map.end(); ++it)
-                align = binary_gcd(align, it->first);
-        }
-
-        // Write dtbs
-        for (auto &val : dtb_map) {
-            val.second.offset = lseek(fd, 0, SEEK_CUR);
-            auto fdt = val.second.fdt;
-            fdt_pack(fdt);
-            auto size = fdt_totalsize(fdt);
-            total_size += xwrite(fd, fdt, size);
+    // Write dtbs
+    for (auto &val : dtb_map) {
+        val.second.offset = lseek(fd, 0, SEEK_CUR);
+        auto fdt = val.second.fdt;
+        fdt_pack(fdt);
+        auto size = fdt_totalsize(fdt);
+        total_size += xwrite(fd, fdt, size);
+        if constexpr (!is_aosp) {
             val.second.len = do_align(size, align);
             write_zero(fd, align_off(lseek(fd, 0, SEEK_CUR), align));
-            // total_size += align_off(lseek(fd, 0, SEEK_CUR), align);  /* Not needed */
-            free(fdt);
         }
-
-        // Patch headers
-        if constexpr (is_dt_table) {
-            auto hdr_rw = reinterpret_cast<Header *>(addr);
-            hdr_rw->total_size = le_to_be(total_size);
-        }
-        auto tables_rw = reinterpret_cast<Table *>(addr + sizeof(Header));
-        for (int i = 0; i < num_dtb; ++i) {
-            auto &blob = dtb_map[be_to_le(tables_rw[i].offset)];
-            tables_rw[i].offset = le_to_be(blob.offset);
-            tables_rw[i].len = le_to_be(blob.len);
-        }
-
-        munmap(addr, mmap_sz);
-        close(fd);
-
-        return 0;
+        free(fdt);
     }
 
-    static int blob_patch(uint8_t *dtb, size_t dtb_sz, const char *out) {
-        vector<uint8_t *> fdt_list;
-        vector<uint32_t> padding_list;
-        for (int i = 0; i < dtb_sz; ++i) {
-            if (memcmp(dtb + i, FDT_MAGIC_STR, 4) == 0) {
-                auto len = fdt_totalsize(dtb + i);
-                auto fdt = static_cast<uint8_t *>(xmalloc(len + MAX_FDT_GROWTH));
-                memcpy(fdt, dtb + i, len);
-                fdt_pack(fdt);
-                uint32_t padding = len - fdt_totalsize(fdt);
-                padding_list.push_back(padding);
-                fdt_open_into(fdt, fdt, len + MAX_FDT_GROWTH);
-                fdt_list.push_back(fdt);
-                i += len - 1;
-            }
-        }
-
-        if (!fdt_patch(fdt_list.begin(), fdt_list.end()))
-            return 1;
-
-        unlink(out);
-        int fd = xopen(out, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-
-        for (int i = 0; i < fdt_list.size(); ++i) {
-            auto fdt = fdt_list[i];
-            fdt_pack(fdt);
-            // Only add padding back if it is anything meaningful
-            if (padding_list[i] > 4) {
-                auto len = fdt_totalsize(fdt);
-                fdt_set_totalsize(fdt, len + padding_list[i]);
-            }
-            xwrite(fd, fdt, fdt_totalsize(fdt));
-            free(fdt);
-        }
-        close(fd);
-
-        return 0;
+    // Patch headers
+    if constexpr (is_aosp) {
+        auto hdr_rw = reinterpret_cast<Header *>(addr);
+        hdr_rw->total_size = le_to_be(total_size);
+    }
+    auto tables_rw = reinterpret_cast<Table *>(addr + sizeof(Header));
+    for (int i = 0; i < num_dtb; ++i) {
+        auto &blob = dtb_map[be_to_le(tables_rw[i].offset)];
+        tables_rw[i].offset = le_to_be(blob.offset);
+        tables_rw[i].len = le_to_be(blob.len);
     }
 
-#define MATCH(s) (memcmp(dtb, s, sizeof(s) - 1) == 0)
+    munmap(addr, mmap_sz);
+    close(fd);
 
-    [[maybe_unused]] static int dtb_patch(const char *in, const char *out) {
-        if (!out)
-            out = in;
-        size_t dtb_sz ;
-        uint8_t *dtb;
-        fprintf(stderr, "Loading dtbs from [%s]\n", in);
-        mmap_ro(in, dtb, dtb_sz);
-        run_finally f([&]{ munmap(dtb, dtb_sz); });
+    return true;
+}
 
-        if (MATCH(QCDT_MAGIC)) {
-            auto hdr = reinterpret_cast<qcdt_hdr*>(dtb);
-            switch (hdr->version) {
-                case 1:
-                    fprintf(stderr, "QCDT v1\n");
-                    return dt_table_patch<qctable_v1>(hdr, out);
-                case 2:
-                    fprintf(stderr, "QCDT v2\n");
-                    return dt_table_patch<qctable_v2>(hdr, out);
-                case 3:
-                    fprintf(stderr, "QCDT v3\n");
-                    return dt_table_patch<qctable_v3>(hdr, out);
-                default:
-                    return 1;
-            }
-        } else if (MATCH(DTBH_MAGIC)) {
-            auto hdr = reinterpret_cast<dtbh_hdr *>(dtb);
-            switch (hdr->version) {
-                case 2:
-                    fprintf(stderr, "DTBH v2\n");
-                    return dt_table_patch<bhtable_v2>(hdr, out);
-                default:
-                    return 1;
-            }
-        } else if (MATCH(PXADT_MAGIC)) {
-            auto hdr = reinterpret_cast<pxadt_hdr *>(dtb);
-            switch (hdr->version) {
-                case 1:
-                    fprintf(stderr, "PXA-DT v1\n");
-                    return dt_table_patch<pxatable_v1>(hdr, out);
-                default:
-                    return 1;
-            }
-        } else if (MATCH(PXA19xx_MAGIC)) {
-            auto hdr = reinterpret_cast<pxa19xx_hdr *>(dtb);
-            switch (hdr->version) {
-                case 1:
-                    fprintf(stderr, "PXA-19xx v1\n");
-                    return dt_table_patch<pxatable_v1>(hdr, out);
-                default:
-                    return 1;
-            }
-        } else if (MATCH(SPRD_MAGIC)) {
-            auto hdr = reinterpret_cast<sprd_hdr *>(dtb);
-            switch (hdr->version) {
-                case 1:
-                    fprintf(stderr, "SPRD v1\n");
-                    return dt_table_patch<sprdtable_v1>(hdr, out);
-                default:
-                    return 1;
-            }
-        } else if (MATCH(DT_TABLE_MAGIC)) {
-            auto hdr = reinterpret_cast<dt_table_header *>(dtb);
-            switch (hdr->version) {
-                case 0:
-                    fprintf(stderr, "DT_TABLE v0\n");
-                    return dt_table_patch<dt_table_entry>(hdr, out);
-                default:
-                    return 1;
-            }
-        } else {
-            return blob_patch(dtb, dtb_sz, out);
+static bool blob_patch(uint8_t *dtb, size_t dtb_sz, const char *out) {
+    vector<uint8_t *> fdt_list;
+    vector<uint32_t> padding_list;
+
+    uint8_t * const end = dtb + dtb_sz;
+    for (uint8_t *curr = dtb; curr < end;) {
+        curr = static_cast<uint8_t*>(memmem(curr, end - curr, DTB_MAGIC, sizeof(fdt32_t)));
+        if (curr == nullptr)
+            break;
+        auto len = fdt_totalsize(curr);
+        auto fdt = static_cast<uint8_t *>(xmalloc(len + MAX_FDT_GROWTH));
+        memcpy(fdt, curr, len);
+        fdt_pack(fdt);
+        uint32_t padding = len - fdt_totalsize(fdt);
+        padding_list.push_back(padding);
+        fdt_open_into(fdt, fdt, len + MAX_FDT_GROWTH);
+        fdt_list.push_back(fdt);
+        curr += len;
+    }
+
+    bool modified = false;
+    for (auto fdt : fdt_list)
+        modified |= fdt_patch(fdt);
+    if (!modified)
+        return false;
+
+    unlink(out);
+    int fd = xopen(out, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+
+    for (int i = 0; i < fdt_list.size(); ++i) {
+        auto fdt = fdt_list[i];
+        fdt_pack(fdt);
+        // Only add padding back if it is anything meaningful
+        if (padding_list[i] > 4) {
+            auto len = fdt_totalsize(fdt);
+            fdt_set_totalsize(fdt, len + padding_list[i]);
         }
+        xwrite(fd, fdt, fdt_totalsize(fdt));
+        free(fdt);
+    }
+    close(fd);
+
+    return true;
+}
+
+#define DTB_MATCH(s) BUFFER_MATCH(dtb, s)
+
+static bool dtb_patch_rebuild(uint8_t *dtb, size_t dtb_sz, const char *file) {
+    if (DTB_MATCH(QCDT_MAGIC)) {
+        auto hdr = reinterpret_cast<qcdt_hdr*>(dtb);
+        switch (hdr->version) {
+            case 1:
+                fprintf(stderr, "QCDT v1\n");
+                return dt_table_patch<qctable_v1>(hdr, file);
+            case 2:
+                fprintf(stderr, "QCDT v2\n");
+                return dt_table_patch<qctable_v2>(hdr, file);
+            case 3:
+                fprintf(stderr, "QCDT v3\n");
+                return dt_table_patch<qctable_v3>(hdr, file);
+            default:
+                return false;
+        }
+    } else if (DTB_MATCH(DTBH_MAGIC)) {
+        auto hdr = reinterpret_cast<dtbh_hdr *>(dtb);
+        switch (hdr->version) {
+            case 2:
+                fprintf(stderr, "DTBH v2\n");
+                return dt_table_patch<bhtable_v2>(hdr, file);
+            default:
+                return false;
+        }
+    } else if (DTB_MATCH(PXADT_MAGIC)) {
+        auto hdr = reinterpret_cast<pxadt_hdr *>(dtb);
+        switch (hdr->version) {
+            case 1:
+                fprintf(stderr, "PXA-DT v1\n");
+                return dt_table_patch<pxatable_v1>(hdr, file);
+            default:
+                return false;
+        }
+    } else if (DTB_MATCH(PXA19xx_MAGIC)) {
+        auto hdr = reinterpret_cast<pxa19xx_hdr *>(dtb);
+        switch (hdr->version) {
+            case 1:
+                fprintf(stderr, "PXA-19xx v1\n");
+                return dt_table_patch<pxatable_v1>(hdr, file);
+            default:
+                return false;
+        }
+    } else if (DTB_MATCH(SPRD_MAGIC)) {
+        auto hdr = reinterpret_cast<sprd_hdr *>(dtb);
+        switch (hdr->version) {
+            case 1:
+                fprintf(stderr, "SPRD v1\n");
+                return dt_table_patch<sprdtable_v1>(hdr, file);
+            default:
+                return false;
+        }
+    } else if (DTB_MATCH(DT_TABLE_MAGIC)) {
+        auto hdr = reinterpret_cast<dt_table_header *>(dtb);
+        switch (hdr->version) {
+            case 0:
+                fprintf(stderr, "DT_TABLE v0\n");
+                return dt_table_patch<dt_table_entry>(hdr, file);
+            default:
+                return false;
+        }
+    } else {
+        return blob_patch(dtb, dtb_sz, file);
     }
 }

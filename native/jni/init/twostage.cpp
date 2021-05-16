@@ -26,9 +26,10 @@ void FirstStageInit::prepare() {
         xmkdirs(FSR "/system/bin", 0755);
         rename("/init" /* magiskinit */, FSR "/system/bin/init");
         symlink("/system/bin/init", FSR "/init");
+        rename("/.backup/init", "/init");
+
         rename("/.backup", FSR "/.backup");
         rename("/overlay.d", FSR "/overlay.d");
-        xsymlink("/system/bin/init", "/init");
 
         chdir(FSR);
     } else {
@@ -38,35 +39,58 @@ void FirstStageInit::prepare() {
         rename("/.backup/init", "/init");
     }
 
-    // Try to load fstab from dt
-    vector<fstab_entry> fstab;
-    read_dt_fstab(fstab);
-
     char fstab_file[128];
     fstab_file[0] = '\0';
 
     // Find existing fstab file
-    for (const char *hw : { cmd->fstab_suffix, cmd->hardware, cmd->hardware_plat }) {
-        if (hw[0] == '\0')
+    for (const char *suffix : { cmd->fstab_suffix, cmd->hardware, cmd->hardware_plat }) {
+        if (suffix[0] == '\0')
             continue;
-        sprintf(fstab_file, "fstab.%s", hw);
-        if (access(fstab_file, F_OK) != 0) {
-            fstab_file[0] = '\0';
-            continue;
-        } else {
-            LOGD("Found fstab file: %s\n", fstab_file);
-            break;
+        for (const char *prefix: { "odm/etc/fstab", "vendor/etc/fstab", "fstab" }) {
+            sprintf(fstab_file, "%s.%s", prefix, suffix);
+            if (access(fstab_file, F_OK) != 0) {
+                fstab_file[0] = '\0';
+            } else {
+                LOGD("Found fstab file: %s\n", fstab_file);
+                goto exit_loop;
+            }
         }
     }
+exit_loop:
 
-    if (fstab.empty()) {
-        // fstab has to be somewhere in ramdisk
-        if (fstab_file[0] == '\0') {
-            LOGE("Cannot find fstab file in ramdisk!\n");
-            return;
+    // Try to load dt fstab
+    vector<fstab_entry> fstab;
+    read_dt_fstab(fstab);
+
+    if (!fstab.empty()) {
+        // Dump dt fstab to fstab file in rootfs and force init to use it instead
+
+        // All dt fstab entries should be first_stage_mount
+        for (auto &entry : fstab) {
+            if (!str_contains(entry.fsmgr_flags, "first_stage_mount")) {
+                if (!entry.fsmgr_flags.empty())
+                    entry.fsmgr_flags += ',';
+                entry.fsmgr_flags += "first_stage_mount";
+            }
         }
 
-        // Parse and load fstab file
+        if (fstab_file[0] == '\0') {
+            const char *suffix =
+                    cmd->fstab_suffix[0] ? cmd->fstab_suffix :
+                    (cmd->hardware[0] ? cmd->hardware :
+                    (cmd->hardware_plat[0] ? cmd->hardware_plat : nullptr));
+            if (suffix == nullptr) {
+                LOGE("Cannot determine fstab suffix!\n");
+                return;
+            }
+            sprintf(fstab_file, "fstab.%s", suffix);
+        }
+
+        // Patch init to force IsDtFstabCompatible() return false
+        auto init = mmap_data::rw("/init");
+        init.patch({ make_pair("android,fstab", "xxx") });
+    } else {
+        // Parse and load the fstab file
         file_readline(fstab_file, [&](string_view l) -> bool {
             if (l[0] == '#' || l.length() == 1)
                 return true;
@@ -90,32 +114,6 @@ void FirstStageInit::prepare() {
             fstab.emplace_back(std::move(entry));
             return true;
         });
-    } else {
-        // All dt fstab entries should be first_stage_mount
-        for (auto &entry : fstab) {
-            if (!str_contains(entry.fsmgr_flags, "first_stage_mount")) {
-                if (!entry.fsmgr_flags.empty())
-                    entry.fsmgr_flags += ',';
-                entry.fsmgr_flags += "first_stage_mount";
-            }
-        }
-
-        // Dump dt fstab to fstab file in rootfs
-        if (fstab_file[0] == '\0') {
-            const char *suffix =
-                cmd->fstab_suffix[0] ? cmd->fstab_suffix :
-                (cmd->hardware[0] ? cmd->hardware :
-                (cmd->hardware_plat[0] ? cmd->hardware_plat : nullptr));
-            if (suffix == nullptr) {
-                LOGE("Cannot determine fstab suffix!\n");
-                return;
-            }
-            sprintf(fstab_file, "fstab.%s", suffix);
-        }
-
-        // Patch init to force IsDtFstabCompatible() return false
-        auto init = raw_data::mmap_rw("/init");
-        init.patch({ make_pair("android,fstab", "xxx") });
     }
 
     {
@@ -142,15 +140,13 @@ void FirstStageInit::prepare() {
 #define REDIR_PATH "/system/bin/am"
 
 void SARInit::first_stage_prep() {
-    int pid = getpid();
-
     xmount("tmpfs", "/dev", "tmpfs", 0, "mode=755");
 
     // Patch init binary
     int src = xopen("/init", O_RDONLY);
     int dest = xopen("/dev/init", O_CREAT | O_WRONLY, 0);
     {
-        auto init = raw_data::read(src);
+        auto init = mmap_data::ro("/init");
         init.patch({ make_pair(INIT_PATH, REDIR_PATH) });
         write(dest, init.buf, init.sz);
         fclone_attr(src, dest);
@@ -174,7 +170,7 @@ void SARInit::first_stage_prep() {
     sigaddset(&block, SIGUSR1);
     sigprocmask(SIG_BLOCK, &block, &old);
 
-    if (int child = xfork(); child) {
+    if (int child = xfork()) {
         LOGD("init daemon [%d]\n", child);
         // Wait for children signal
         int sig;
@@ -190,22 +186,21 @@ void SARInit::first_stage_prep() {
         xlisten(sockfd, 1);
 
         // Resume parent
-        kill(pid, SIGUSR1);
+        kill(getppid(), SIGUSR1);
 
         // Wait for second stage ack
         int client = xaccept4(sockfd, nullptr, nullptr, SOCK_CLOEXEC);
 
         // Write backup files
-        char *tmp_dir = read_string(client);
-        chdir(tmp_dir);
-        free(tmp_dir);
+        string tmp_dir = read_string(client);
+        chdir(tmp_dir.data());
         int cfg = xopen(INTLROOT "/config", O_WRONLY | O_CREAT, 0);
         xwrite(cfg, config.buf, config.sz);
         close(cfg);
         restore_folder(ROOTOVL, overlays);
 
         // Ack and bail out!
-        write(sockfd, &sockfd, sizeof(sockfd));
+        write_int(client, 0);
         close(client);
         close(sockfd);
 

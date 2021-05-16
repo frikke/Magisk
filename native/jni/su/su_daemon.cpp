@@ -1,20 +1,14 @@
 #include <unistd.h>
-#include <pthread.h>
-#include <stdlib.h>
 #include <fcntl.h>
-#include <string.h>
-#include <signal.h>
 #include <pwd.h>
-#include <time.h>
 #include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
 
 #include <daemon.hpp>
 #include <utils.hpp>
 #include <selinux.hpp>
+#include <db.hpp>
 
 #include "su.hpp"
 #include "pts.hpp"
@@ -169,14 +163,14 @@ void su_daemon_handler(int client, struct ucred *credential) {
 
     su_context ctx = {
         .info = get_su_info(credential->uid),
-        .req = su_request(true),
+        .req = su_request(),
         .pid = credential->pid
     };
 
     // Read su_request
     xxread(client, &ctx.req, sizeof(su_req_base));
-    ctx.req.shell = read_string(client);
-    ctx.req.command = read_string(client);
+    read_string(client, ctx.req.shell);
+    read_string(client, ctx.req.command);
 
     if (ctx.info->access.log)
         app_log(ctx);
@@ -229,18 +223,18 @@ void su_daemon_handler(int client, struct ucred *credential) {
     xsetsid();
 
     // Get pts_slave
-    char *pts_slave = read_string(client);
+    string pts_slave = read_string(client);
 
     // The FDs for each of the streams
     int infd  = recv_fd(client);
     int outfd = recv_fd(client);
     int errfd = recv_fd(client);
 
-    if (pts_slave[0]) {
-        LOGD("su: pts_slave=[%s]\n", pts_slave);
+    if (!pts_slave.empty()) {
+        LOGD("su: pts_slave=[%s]\n", pts_slave.data());
         // Check pts_slave file is owned by daemon_from_uid
         struct stat st;
-        xstat(pts_slave, &st);
+        xstat(pts_slave.data(), &st);
 
         // If caller is not root, ensure the owner of pts_slave is the caller
         if(st.st_uid != ctx.info->uid && ctx.info->uid != 0)
@@ -249,7 +243,7 @@ void su_daemon_handler(int client, struct ucred *credential) {
         // Opening the TTY has to occur after the
         // fork() and setsid() so that it becomes
         // our controlling TTY and not the daemon's
-        int ptsfd = xopen(pts_slave, O_RDWR);
+        int ptsfd = xopen(pts_slave.data(), O_RDWR);
 
         if (infd < 0)
             infd = ptsfd;
@@ -258,8 +252,6 @@ void su_daemon_handler(int client, struct ucred *credential) {
         if (errfd < 0)
             errfd = ptsfd;
     }
-
-    free(pts_slave);
 
     // Swap out stdin, stdout, stderr
     xdup2(infd, STDIN_FILENO);
@@ -296,13 +288,13 @@ void su_daemon_handler(int client, struct ucred *credential) {
             break;
     }
 
-    const char *argv[] = { nullptr, nullptr, nullptr, nullptr };
+    const char *argv[4] = { nullptr };
 
-    argv[0] = ctx.req.login ? "-" : ctx.req.shell;
+    argv[0] = ctx.req.login ? "-" : ctx.req.shell.data();
 
-    if (ctx.req.command[0]) {
+    if (!ctx.req.command.empty()) {
         argv[1] = "-c";
-        argv[2] = ctx.req.command;
+        argv[2] = ctx.req.command.data();
     }
 
     // Setup environment
@@ -327,7 +319,7 @@ void su_daemon_handler(int client, struct ucred *credential) {
             setenv("HOME", pw->pw_dir, 1);
             setenv("USER", pw->pw_name, 1);
             setenv("LOGNAME", pw->pw_name, 1);
-            setenv("SHELL", ctx.req.shell, 1);
+            setenv("SHELL", ctx.req.shell.data(), 1);
         }
     }
 
@@ -336,8 +328,8 @@ void su_daemon_handler(int client, struct ucred *credential) {
     sigemptyset(&block_set);
     sigprocmask(SIG_SETMASK, &block_set, nullptr);
     set_identity(ctx.req.uid);
-    execvp(ctx.req.shell, (char **) argv);
-    fprintf(stderr, "Cannot execute %s: %s\n", ctx.req.shell, strerror(errno));
+    execvp(ctx.req.shell.data(), (char **) argv);
+    fprintf(stderr, "Cannot execute %s: %s\n", ctx.req.shell.data(), strerror(errno));
     PLOGE("exec");
     exit(EXIT_FAILURE);
 }

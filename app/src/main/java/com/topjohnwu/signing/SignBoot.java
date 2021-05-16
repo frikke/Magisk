@@ -1,5 +1,6 @@
 package com.topjohnwu.signing;
 
+import androidx.annotation.Keep;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
@@ -32,6 +33,7 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 
+@Keep
 public class SignBoot {
 
     private static final int BOOT_IMAGE_HEADER_V1_RECOVERY_DTBO_SIZE_OFFSET = 1632;
@@ -88,6 +90,21 @@ public class SignBoot {
         }
     }
 
+    private static int fullRead(InputStream in, byte[] b) throws IOException {
+        return fullRead(in, b, 0, b.length);
+    }
+
+    private static int fullRead(InputStream in, byte[] b, int off, int len) throws IOException {
+        int n = 0;
+        while (n < len) {
+            int count = in.read(b, off + n, len - n);
+            if (count <= 0)
+                break;
+            n += count;
+        }
+        return n;
+    }
+
     public static boolean doSignature(
             @Nullable X509Certificate cert, @Nullable PrivateKey key,
             @NonNull InputStream imgIn, @NonNull OutputStream imgOut, @NonNull String target
@@ -96,7 +113,7 @@ public class SignBoot {
             PushBackRWStream in = new PushBackRWStream(imgIn, imgOut);
             byte[] hdr = new byte[BOOT_IMAGE_HEADER_SIZE_MAXIMUM];
             // First read the header
-            in.read(hdr);
+            fullRead(in, hdr);
             int signableSize = getSignableImageSize(hdr);
             // Unread header
             in.unread(hdr);
@@ -126,7 +143,7 @@ public class SignBoot {
         try {
             // Read the header for size
             byte[] hdr = new byte[BOOT_IMAGE_HEADER_SIZE_MAXIMUM];
-            if (imgIn.read(hdr) != hdr.length) {
+            if (fullRead(imgIn, hdr) != hdr.length) {
                 System.err.println("Unable to read image header");
                 return false;
             }
@@ -135,7 +152,7 @@ public class SignBoot {
             // Read the rest of the image
             byte[] rawImg = Arrays.copyOf(hdr, signableSize);
             int remain = signableSize - hdr.length;
-            if (imgIn.read(rawImg, hdr.length, remain) != remain) {
+            if (fullRead(imgIn, rawImg, hdr.length, remain) != remain) {
                 System.err.println("Unable to read image");
                 return false;
             }
@@ -179,6 +196,9 @@ public class SignBoot {
         int secondSize = image.getInt();
         image.getLong(); // second_addr + tags_addr
         int pageSize = image.getInt();
+        if (pageSize >= 0x02000000) {
+            throw new IllegalArgumentException("Invalid image header: PXA header detected");
+        }
         int length = pageSize // include the page aligned image header
                 + ((kernelSize + pageSize - 1) / pageSize) * pageSize
                 + ((ramdskSize + pageSize - 1) / pageSize) * pageSize
@@ -197,8 +217,7 @@ public class SignBoot {
                 image.getLong(); // dtb address
             }
             if (image.position() != headerSize) {
-                throw new IllegalArgumentException(
-                        "Invalid image header: invalid header length");
+                throw new IllegalArgumentException("Invalid image header: invalid header length");
             }
         } else {
             // headerVersion is 0 or actually dt/extra size in this case

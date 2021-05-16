@@ -1,7 +1,5 @@
 #include <sched.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <errno.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -63,12 +61,24 @@ int xopenat(int dirfd, const char *pathname, int flags, mode_t mode) {
     return fd;
 }
 
+// Write exact same size as count
 ssize_t xwrite(int fd, const void *buf, size_t count) {
-    int ret = write(fd, buf, count);
-    if (count != ret) {
-        PLOGE("write");
+    size_t write_sz = 0;
+    ssize_t ret;
+    do {
+        ret = write(fd, (byte *) buf + write_sz, count - write_sz);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            PLOGE("write");
+            return ret;
+        }
+        write_sz += ret;
+    } while (write_sz != count && ret != 0);
+    if (write_sz != count) {
+        PLOGE("write (%zu != %zu)", count, write_sz);
     }
-    return ret;
+    return write_sz;
 }
 
 // Read error other than EOF
@@ -82,11 +92,22 @@ ssize_t xread(int fd, void *buf, size_t count) {
 
 // Read exact same size as count
 ssize_t xxread(int fd, void *buf, size_t count) {
-    int ret = read(fd, buf, count);
-    if (count != ret) {
-        PLOGE("read (%zu != %d)", count, ret);
+    size_t read_sz = 0;
+    ssize_t ret;
+    do {
+        ret = read(fd, (byte *) buf + read_sz, count - read_sz);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            PLOGE("read");
+            return ret;
+        }
+        read_sz += ret;
+    } while (read_sz != count && ret != 0);
+    if (read_sz != count) {
+        PLOGE("read (%zu != %zu)", count, read_sz);
     }
-    return ret;
+    return read_sz;
 }
 
 int xpipe2(int pipefd[2], int flags) {
@@ -242,13 +263,21 @@ ssize_t xrecvmsg(int sockfd, struct msghdr *msg, int flags) {
     return rec;
 }
 
-int xpthread_create(pthread_t *thread, const pthread_attr_t *attr, 
+int xpthread_create(pthread_t *thread, const pthread_attr_t *attr,
                     void *(*start_routine) (void *), void *arg) {
     errno = pthread_create(thread, attr, start_routine, arg);
     if (errno) {
         PLOGE("pthread_create");
     }
     return errno;
+}
+
+int xaccess(const char *path, int mode) {
+    int ret = access(path, mode);
+    if (ret < 0) {
+        PLOGE("access %s", path);
+    }
+    return ret;
 }
 
 int xstat(const char *pathname, struct stat *buf) {
@@ -328,6 +357,20 @@ ssize_t xreadlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
     }
     return ret;
 #endif
+}
+
+int xfaccessat(int dirfd, const char *pathname) {
+    int ret = faccessat(dirfd, pathname, F_OK, 0);
+    if (ret < 0) {
+        PLOGE("faccessat %s", pathname);
+    }
+#if defined(__i386__) || defined(__x86_64__)
+    if (ret > 0 && errno == 0) {
+        LOGD("faccessat success but ret is %d\n", ret);
+        ret = 0;
+    }
+#endif
+    return ret;
 }
 
 int xsymlink(const char *target, const char *linkpath) {

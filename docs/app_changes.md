@@ -1,5 +1,18 @@
 # Magisk Manager Changelog
 
+### v8.0.7
+
+- Fix sepolicy rule migration when upgrading
+
+### v8.0.6
+
+- Minor UI changes
+- Update internal scripts
+
+### v8.0.5
+
+- Fix sepolicy rule copying
+
 ### v8.0.4
 
 - A lot of stability changes and minor bug fixes

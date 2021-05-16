@@ -1,26 +1,19 @@
 /*
- * Copyright 2017, John Wu (@topjohnwu)
+ * Copyright 2017 - 2021, John Wu (@topjohnwu)
  * Copyright 2015, Pierre-Hugues Husson <phh@phh.me>
  * Copyright 2010, Adam Shanks (@ChainsDD)
  * Copyright 2008, Zinx Verituse (@zinxv)
  */
 
-/* su.c - The main function running in the daemon
- */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <fcntl.h>
 #include <pwd.h>
-#include <errno.h>
-#include <signal.h>
 #include <sched.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#include <magisk.hpp>
 #include <daemon.hpp>
 #include <utils.hpp>
 #include <flags.hpp>
@@ -48,18 +41,6 @@ static void usage(int status) {
     "  -mm, -M,\n"
     "  --mount-master                force run in the global mount namespace\n");
     exit(status);
-}
-
-static char *concat_commands(int argc, char *argv[]) {
-    char command[ARG_MAX];
-    command[0] = '\0';
-    for (int i = optind - 1; i < argc; ++i) {
-        if (command[0])
-            sprintf(command, "%s %s", command, argv[i]);
-        else
-            strcpy(command, argv[i]);
-    }
-    return strdup(command);
 }
 
 static void sighandler(int sig) {
@@ -121,7 +102,11 @@ int su_client_main(int argc, char *argv[]) {
     while ((c = getopt_long(argc, argv, "c:hlmps:Vvuz:M", long_opts, nullptr)) != -1) {
         switch (c) {
             case 'c':
-                su_req.command = concat_commands(argc, argv);
+                for (int i = optind - 1; i < argc; ++i) {
+                    if (!su_req.command.empty())
+                        su_req.command += ' ';
+                    su_req.command += argv[i];
+                }
                 optind = argc;
                 break;
             case 'h':

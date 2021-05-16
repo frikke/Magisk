@@ -5,7 +5,6 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import androidx.core.graphics.Insets
 import androidx.databinding.DataBindingUtil
 import androidx.databinding.OnRebindCallback
 import androidx.databinding.ViewDataBinding
@@ -39,6 +38,11 @@ abstract class BaseUIFragment<VM : BaseViewModel, Binding : ViewDataBinding> :
             it.lifecycleOwner = this
         }
         return binding.root
+    }
+
+    override fun onStart() {
+        super.onStart()
+        activity.supportActionBar?.subtitle = null
     }
 
     override fun onEventDispatched(event: ViewEvent) = when(event) {

@@ -3,10 +3,8 @@ package com.topjohnwu.magisk.events.dialog
 import android.app.ProgressDialog
 import android.widget.Toast
 import com.topjohnwu.magisk.R
-import com.topjohnwu.magisk.core.Info
-import com.topjohnwu.magisk.core.download.Action
-import com.topjohnwu.magisk.core.download.DownloadService
-import com.topjohnwu.magisk.core.download.Subject
+import com.topjohnwu.magisk.arch.BaseUIActivity
+import com.topjohnwu.magisk.ui.flash.FlashFragment
 import com.topjohnwu.magisk.utils.Utils
 import com.topjohnwu.magisk.view.MagiskDialog
 import com.topjohnwu.superuser.Shell
@@ -20,12 +18,10 @@ class UninstallDialog : DialogEvent() {
                 titleRes = R.string.restore_img
                 onClick { restore() }
             }
-        if (Info.remote.uninstaller.link.isNotEmpty()) {
-            dialog.applyButton(MagiskDialog.ButtonType.NEGATIVE) {
+            .applyButton(MagiskDialog.ButtonType.NEGATIVE) {
                 titleRes = R.string.complete_uninstall
                 onClick { completeUninstall() }
             }
-        }
     }
 
     @Suppress("DEPRECATION")
@@ -46,7 +42,8 @@ class UninstallDialog : DialogEvent() {
     }
 
     private fun completeUninstall() {
-        DownloadService.start(dialog.context, Subject.Magisk(Action.Uninstall))
+        (dialog.ownerActivity as? BaseUIActivity<*, *>)
+                ?.navigation?.navigate(FlashFragment.uninstall())
     }
 
 }

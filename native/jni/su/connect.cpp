@@ -1,7 +1,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#include <daemon.hpp>
 #include <utils.hpp>
 #include <selinux.hpp>
 
@@ -31,7 +30,7 @@ enum {
 ? info->uid / 100000 : 0)
 
 #define get_cmd(to) \
-(to.command[0] ? to.command : to.shell[0] ? to.shell : DEFAULT_SHELL)
+(to.command.empty() ? (to.shell.empty() ? DEFAULT_SHELL : to.shell.data()) : to.command.data())
 
 class Extra {
     const char *key;
@@ -43,7 +42,7 @@ class Extra {
     union {
         int int_val;
         bool bool_val;
-        const char * str_val;
+        const char *str_val;
     };
     char buf[32];
 public:
@@ -146,7 +145,7 @@ static void exec_cmd(const char *action, vector<Extra> &data,
 
     // Finally, fallback to start activity with component name
     args[4] = "-n";
-    sprintf(target, "%s/a.m", info->str[SU_MANAGER].data());
+    sprintf(target, "%s/.ui.surequest.SuRequestActivity", info->str[SU_MANAGER].data());
     exec.fd = -2;
     exec.fork = fork_dont_care;
     exec_command(exec);

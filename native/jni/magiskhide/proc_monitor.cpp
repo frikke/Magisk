@@ -18,18 +18,13 @@ using namespace std;
 
 static int inotify_fd = -1;
 
-static void term_thread(int sig = SIGTERMTHRD);
 static void new_zygote(int pid);
 
-/**********************
- * All data structures
- **********************/
+pthread_t monitor_thread;
 
-set<pair<string, string>> hide_set;                 /* set of <pkg, process> pair */
-static map<int, struct stat> zygote_map;            /* zygote pid -> mnt ns */
-static map<int, vector<string_view>> uid_proc_map;  /* uid -> list of process */
-
-pthread_mutex_t monitor_lock;
+/******************
+ * Data structures
+ ******************/
 
 #define PID_MAX 32768
 struct pid_set {
@@ -41,15 +36,14 @@ private:
 };
 
 // true if pid is monitored
-pid_set attaches;
+static pid_set attaches;
+
+// zygote pid -> mnt ns
+static map<int, struct stat> zygote_map;
 
 /********
  * Utils
  ********/
-
-static inline long xptrace(int request, pid_t pid, void *addr, uintptr_t data) {
-    return xptrace(request, pid, addr, reinterpret_cast<void *>(data));
-}
 
 static inline int read_ns(const int pid, struct stat *st) {
     char path[32];
@@ -71,36 +65,6 @@ static int parse_ppid(int pid) {
     fscanf(stat.get(), "%*d %*s %*c %d", &ppid);
 
     return ppid;
-}
-
-void update_uid_map() {
-    mutex_guard lock(monitor_lock);
-    uid_proc_map.clear();
-    string data_path(APP_DATA_DIR);
-    size_t len = data_path.length();
-    auto dir = open_dir(APP_DATA_DIR);
-    bool first_iter = true;
-    for (dirent *entry; (entry = xreaddir(dir.get()));) {
-        data_path.resize(len);
-        data_path += '/';
-        data_path += entry->d_name;  // multiuser user id
-        data_path += '/';
-        size_t user_len = data_path.length();
-        struct stat st;
-        for (auto &hide : hide_set) {
-            if (hide.first == ISOLATED_MAGIC) {
-                if (!first_iter) continue;
-                // Setup isolated processes
-                uid_proc_map[-1].emplace_back(hide.second);
-            }
-            data_path.resize(user_len);
-            data_path += hide.first;
-            if (stat(data_path.data(), &st))
-                continue;
-            uid_proc_map[st.st_uid].emplace_back(hide.second);
-        }
-        first_iter = false;
-    }
 }
 
 static bool is_zygote_done() {
@@ -136,7 +100,7 @@ static void check_zygote() {
 static void setup_inotify() {
     inotify_fd = xinotify_init1(IN_CLOEXEC);
     if (inotify_fd < 0)
-        term_thread();
+        return;
 
     // Setup inotify asynchronous I/O
     fcntl(inotify_fd, F_SETFL, O_ASYNC);
@@ -164,8 +128,8 @@ static void setup_inotify() {
  ************************/
 
 static void inotify_event(int) {
-    /* Make sure we can actually read stuffs
-     * or else the whole thread will be blocked.*/
+    // Make sure we can actually read stuffs
+    // or else the whole thread will be blocked.
     struct pollfd pfd = {
         .fd = inotify_fd,
         .events = POLLIN,
@@ -181,18 +145,21 @@ static void inotify_event(int) {
     check_zygote();
 }
 
-// Workaround for the lack of pthread_cancel
 static void term_thread(int) {
     LOGD("proc_monitor: cleaning up\n");
-    uid_proc_map.clear();
     zygote_map.clear();
-    hide_set.clear();
     attaches.reset();
-    // Misc
-    set_hide_state(false);
-    pthread_mutex_destroy(&monitor_lock);
     close(inotify_fd);
     inotify_fd = -1;
+    // Restore all signal handlers that was set
+    sigset_t set;
+    sigfillset(&set);
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);
+    struct sigaction act{};
+    act.sa_handler = SIG_DFL;
+    sigaction(SIGTERMTHRD, &act, nullptr);
+    sigaction(SIGIO, &act, nullptr);
+    sigaction(SIGALRM, &act, nullptr);
     LOGD("proc_monitor: terminate\n");
     pthread_exit(nullptr);
 }
@@ -226,8 +193,10 @@ static bool check_pid(int pid) {
         return true;
     }
 
+    int uid = st.st_uid;
+
     // UID hasn't changed
-    if (st.st_uid == 0)
+    if (uid == 0)
         return false;
 
     sprintf(path, "/proc/%d/cmdline", pid);
@@ -243,60 +212,29 @@ static bool check_pid(int pid) {
         cmdline == "usap32"sv || cmdline == "usap64"sv)
         return false;
 
-    int uid = st.st_uid;
-    auto it = uid_proc_map.end();
-
-    if (uid % 100000 > 90000) {
-        // Isolated process
-        it = uid_proc_map.find(-1);
-        if (it == uid_proc_map.end())
-            goto not_target;
-        for (auto &s : it->second) {
-            if (str_starts(cmdline, s)) {
-                LOGI("proc_monitor: (isolated) [%s] PID=[%d] UID=[%d]\n", cmdline, pid, uid);
-                goto inject_and_hide;
-            }
-        }
-    }
-
-    it = uid_proc_map.find(uid);
-    if (it == uid_proc_map.end())
+    if (!is_hide_target(uid, cmdline, 95))
         goto not_target;
-    for (auto &s : it->second) {
-        if (s != cmdline)
-            continue;
 
-        if (str_ends(s, "_zygote")) {
-            LOGI("proc_monitor: (app zygote) [%s] PID=[%d] UID=[%d]\n", cmdline, pid, uid);
-            goto inject_and_hide;
+    // Ensure ns is separated
+    read_ns(pid, &st);
+    for (auto &zit : zygote_map) {
+        if (zit.second.st_ino == st.st_ino &&
+            zit.second.st_dev == st.st_dev) {
+            // ns not separated, abort
+            LOGW("proc_monitor: skip [%s] PID=[%d] UID=[%d]\n", cmdline, pid, uid);
+            goto not_target;
         }
-
-        // Double check whether ns is separated
-        read_ns(pid, &st);
-        for (auto &zit : zygote_map) {
-            if (zit.second.st_ino == st.st_ino &&
-                zit.second.st_dev == st.st_dev) {
-                // For some reason ns is not separated, abort
-                goto not_target;
-            }
-        }
-
-        // Finally this is our target!
-        // Detach from ptrace but should still remain stopped.
-        // The hide daemon will resume the process.
-        LOGI("proc_monitor: [%s] PID=[%d] UID=[%d]\n", cmdline, pid, uid);
-        detach_pid(pid, SIGSTOP);
-        hide_daemon(pid);
-        return true;
     }
+
+    // Detach but the process should still remain stopped
+    // The hide daemon will resume the process after hiding it
+    LOGI("proc_monitor: [%s] PID=[%d] UID=[%d]\n", cmdline, pid, uid);
+    detach_pid(pid, SIGSTOP);
+    hide_daemon(pid);
+    return true;
 
 not_target:
     PTRACE_LOG("[%s] is not our target\n", cmdline);
-    detach_pid(pid);
-    return true;
-
-inject_and_hide:
-    // TODO: handle isolated processes and app zygotes
     detach_pid(pid);
     return true;
 }
@@ -343,19 +281,32 @@ static void new_zygote(int pid) {
     xptrace(PTRACE_CONT, pid);
 }
 
-#define WEVENT(s) (((s) & 0xffff0000) >> 16)
 #define DETACH_AND_CONT { detach_pid(pid); continue; }
 
 void proc_monitor() {
-    // Unblock some signals
-    sigset_t block_set;
-    sigemptyset(&block_set);
-    sigaddset(&block_set, SIGTERMTHRD);
-    sigaddset(&block_set, SIGIO);
-    sigaddset(&block_set, SIGALRM);
-    pthread_sigmask(SIG_UNBLOCK, &block_set, nullptr);
+    monitor_thread = pthread_self();
+
+    // Backup original mask
+    sigset_t orig_mask;
+    pthread_sigmask(SIG_SETMASK, nullptr, &orig_mask);
+
+    sigset_t unblock_set;
+    sigemptyset(&unblock_set);
+    sigaddset(&unblock_set, SIGTERMTHRD);
+    sigaddset(&unblock_set, SIGIO);
+    sigaddset(&unblock_set, SIGALRM);
 
     struct sigaction act{};
+    sigfillset(&act.sa_mask);
+    act.sa_handler = SIG_IGN;
+    sigaction(SIGTERMTHRD, &act, nullptr);
+    sigaction(SIGIO, &act, nullptr);
+    sigaction(SIGALRM, &act, nullptr);
+
+    // Temporary unblock to clear pending signals
+    pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+    pthread_sigmask(SIG_SETMASK, &orig_mask, nullptr);
+
     act.sa_handler = term_thread;
     sigaction(SIGTERMTHRD, &act, nullptr);
     act.sa_handler = inotify_event;
@@ -375,6 +326,8 @@ void proc_monitor() {
     }
 
     for (int status;;) {
+        pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+
         const int pid = waitpid(-1, &status, __WALL | __WNOTHREAD);
         if (pid < 0) {
             if (errno == ECHILD) {
@@ -388,6 +341,8 @@ void proc_monitor() {
             }
             continue;
         }
+
+        pthread_sigmask(SIG_SETMASK, &orig_mask, nullptr);
 
         if (!WIFSTOPPED(status) /* Ignore if not ptrace-stop */)
             DETACH_AND_CONT;

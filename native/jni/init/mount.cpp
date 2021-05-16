@@ -86,7 +86,7 @@ static int64_t setup_block(bool write_block) {
                 sprintf(blk_info.block_dev, "/dev/block/%s", dev.devname);
             }
             dev_t rdev = makedev(dev.major, dev.minor);
-            mknod(blk_info.block_dev, S_IFBLK | 0600, rdev);
+            xmknod(blk_info.block_dev, S_IFBLK | 0600, rdev);
             return rdev;
         }
         // Wait 10ms and try again
@@ -228,22 +228,26 @@ void MagiskInit::mount_rules_dir(const char *dev_base, const char *mnt_base) {
         if (setup_block(false) < 0)
             goto cache;
     }
-    // Try to mount with either ext4 or f2fs
-    // Failure means either FDE or metadata encryption
-    if (!do_mount("ext4") && !do_mount("f2fs"))
+    // WARNING: DO NOT ATTEMPT TO MOUNT F2FS AS IT MAY CRASH THE KERNEL
+    // Failure means either f2fs, FDE, or metadata encryption
+    if (!do_mount("ext4"))
         goto cache;
 
     strcpy(p, "/data/unencrypted");
-    if (access(path, F_OK) == 0) {
+    if (xaccess(path, F_OK) == 0) {
         // FBE, need to use an unencrypted path
         custom_rules_dir = path + "/magisk"s;
     } else {
         // Skip if /data/adb does not exist
-        strcpy(p, "/data/adb");
-        if (access(path, F_OK) != 0)
+        strcpy(p, SECURE_DIR);
+        if (xaccess(path, F_OK) != 0)
             return;
+        strcpy(p, MODULEROOT);
+        if (xaccess(path, F_OK) != 0) {
+            goto cache;
+        }
         // Unencrypted, directly use module paths
-        custom_rules_dir = string(mnt_base) + MODULEROOT;
+        custom_rules_dir = string(path);
     }
     goto success;
 
@@ -289,7 +293,7 @@ success:
 }
 
 void RootFSInit::early_mount() {
-    self = raw_data::read("/init");
+    self = mmap_data::ro("/init");
 
     LOGD("Restoring /init\n");
     rename("/.backup/init", "/init");
@@ -301,9 +305,9 @@ void SARBase::backup_files() {
     if (access("/overlay.d", F_OK) == 0)
         backup_folder("/overlay.d", overlays);
 
-    self = raw_data::read("/proc/self/exe");
+    self = mmap_data::ro("/proc/self/exe");
     if (access("/.backup/.magisk", R_OK) == 0)
-        config = raw_data::read("/.backup/.magisk");
+        config = mmap_data::ro("/.backup/.magisk");
 }
 
 void SARBase::mount_system_root() {
@@ -345,10 +349,8 @@ void SARInit::early_mount() {
     mount_system_root();
     switch_root("/system_root");
 
-    {
-        auto init = raw_data::mmap_ro("/init");
-        is_two_stage = init.contains("selinux_setup");
-    }
+    // Use the apex folder to determine whether 2SI (Android 10+)
+    is_two_stage = access("/apex", F_OK) == 0;
     LOGD("is_two_stage: [%d]\n", is_two_stage);
 
     if (!is_two_stage) {
@@ -380,13 +382,6 @@ void BaseInit::exec_init() {
     exit(1);
 }
 
-static void patch_socket_name(const char *path) {
-    char rstr[16];
-    gen_rand_str(rstr, sizeof(rstr));
-    auto bin = raw_data::mmap_rw(path);
-    bin.patch({ make_pair(MAIN_SOCKET, rstr) });
-}
-
 void MagiskInit::setup_tmp(const char *path) {
     LOGD("Setup Magisk tmp at %s\n", path);
     xmount("tmpfs", path, "tmpfs", 0, "mode=755");
@@ -403,8 +398,8 @@ void MagiskInit::setup_tmp(const char *path) {
     fd = xopen("magiskinit", O_WRONLY | O_CREAT, 0755);
     xwrite(fd, self.buf, self.sz);
     close(fd);
-    dump_magisk("magisk", 0755);
-    patch_socket_name("magisk");
+
+    // The magisk binary will be handled later
 
     // Create applet symlinks
     for (int i = 0; applet_names[i]; ++i)
